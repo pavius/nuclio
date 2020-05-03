@@ -20,6 +20,8 @@ type claim struct {
 	recordBatchChan          chan *RecordBatch
 	stopRecordBatchFetchChan chan struct{}
 	currentShardLocation     string
+	currentSequenceNumber    uint64
+	someCounter int
 }
 
 func newClaim(member *member, shardID int) (*claim, error) {
@@ -134,8 +136,14 @@ func (c *claim) fetchRecordBatch(location string) (string, error) {
 
 	getRecordsOutput := response.Output.(*v3io.GetRecordsOutput)
 
+	// workaround for possible underlying issue
+	nextLocation, err := c.getNextLocationOrSeek(getRecordsOutput.NextLocation)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get next location or seek")
+	}
+
 	if len(getRecordsOutput.Records) == 0 {
-		return getRecordsOutput.NextLocation, nil
+		return nextLocation, nil
 	}
 
 	records := make([]v3io.StreamRecord, len(getRecordsOutput.Records))
@@ -155,14 +163,19 @@ func (c *claim) fetchRecordBatch(location string) (string, error) {
 	recordBatch := RecordBatch{
 		Location:     location,
 		Records:      records,
-		NextLocation: getRecordsOutput.NextLocation,
+		NextLocation: nextLocation,
 		ShardID:      c.shardID,
+	}
+
+	// set last sequence number
+	if len(recordBatch.Records) != 0 {
+		c.currentSequenceNumber = recordBatch.Records[len(recordBatch.Records) - 1].SequenceNumber
 	}
 
 	// write into chunks channel, blocking if there's no space
 	c.recordBatchChan <- &recordBatch
 
-	return getRecordsOutput.NextLocation, nil
+	return nextLocation, nil
 }
 
 func (c *claim) getCurrentShardLocation(shardID int) (string, error) {
@@ -201,4 +214,47 @@ func (c *claim) getCurrentShardLocation(shardID int) (string, error) {
 	}
 
 	return currentShardLocation, nil
+}
+
+func (c *claim) getNextLocationOrSeek(nextLocation string) (string, error) {
+	//if c.someCounter == 3 || c.someCounter == 8 {
+	//	c.logger.WarnWith("Injecting error")
+	//	nextLocation = ""
+	//}
+	//
+	//c.someCounter++
+	//
+	if nextLocation != "" {
+		return nextLocation, nil
+	}
+	
+	path, err := c.member.streamConsumerGroup.getShardPath(c.shardID)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get shared path")
+	}
+
+	seekShardInput := v3io.SeekShardInput{
+		Path: path,
+		Type: v3io.SeekShardInputTypeSequence,
+		StartingSequenceNumber: c.currentSequenceNumber,
+	}
+
+	c.logger.WarnWith("Got empty location - resorting to seek",
+		"path", seekShardInput.Path,
+		"seqnum", seekShardInput.StartingSequenceNumber)
+
+	location, err := c.member.streamConsumerGroup.getShardLocationWithSeek(&seekShardInput)
+	if err != nil {
+		return "", errors.Wrap(err, "Failed to get shard location with seek")
+	}
+
+	if location == "" {
+		return "", errors.Errorf("Seek returned empty location (%s)", seekShardInput.Path)
+	}
+
+	c.logger.DebugWith("Resolved empty location",
+		"path", seekShardInput.Path,
+		"location", location)
+
+	return location, nil
 }
